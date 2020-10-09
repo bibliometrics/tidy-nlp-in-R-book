@@ -1,37 +1,5 @@
----
-output: github_document
----
+[![Netlify Status](https://api.netlify.com/api/v1/badges/1f6443b9-c220-47cb-b8b4-2cda9f24a302/deploy-status)](https://app.netlify.com/sites/inspiring-kepler-2ccad1/deploys)
 
-Work in process of text discussing various text analysis techniques in R.  
+This is the repository for the book [**Supervised Machine Learning for Text Analysis in R**](https://smltar.com/), by Emil Hvitfeldt and Julia Silge.
 
-The Scope of this book is to be used by a R user who are interested in natural language processing for personal or (small to medium sized) professional use. A focus on visualizing results will in addition be given in this book.
-
-What will not be covered in this book:
-- Speech processing
-- Machine Translation
-- Text to Speech
-- Image Understanding
-- Text generation (maybe)
-
-```{r, eval=FALSE}
-- Introduction
-    - What will and wont be in this book
-- General Natural language information/Word Level Semantics
-    - What is a word?
-    - stopwords
-    - Lemma/stemming
-    - part of speech
-    - Tokenization
-    - Text mining /w tidytext
-    - Word embeddings
-- Non-deep learning methods
-    - Regression
-    - Classification
-    - Summarizing
-    - Topic modeling/clustering
-- Deep learning methods
-    - Regression
-    - Classification
-    - Summarizing
-    - topic modeling/clustering
-```
+Please note that this work is written under a [Contributor Code of Conduct](CODE_OF_CONDUCT.md) and the online version is licensed under a [Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](https://creativecommons.org/licenses/by-nc-sa/4.0/). By participating in this project (for example, by submitting an [issue](https://github.com/EmilHvitfeldt/smltar/issues) with suggestions or edits) you agree to abide by its terms.

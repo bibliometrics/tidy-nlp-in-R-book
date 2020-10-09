@@ -1,27 +1,36 @@
 new_session: yes
 
+output_dir: "docs"
+book_filename: bookdown
+clean: [packages.bib, bookdown.bbl]
+delete_merged_file: true
+language:
+  label:
+    fig: "FIGURE "
+    tab: "TABLE "
+  ui:
+    edit: "Edit"
+    chapter_name: "Chapter "
+
 rmd_files: [
   "index.Rmd",
-  "introduction.Rmd",
-
-  "what-are-words.Rmd",
+  
+  "model_language.Rmd",
   "tokenization.Rmd",
-  "stopwords.Rmd",
+  "stopwords.Rmd",  
   "stemming.Rmd",
-  "part-of-speech.Rmd",
-  "text-mining.Rmd",
   "word-embeddings.Rmd",
   
+  "ml_preface.Rmd",
   "ml_regression.Rmd",
   "ml_classification.Rmd",
-  "ml_summarizing.Rmd",
-  "ml_clustering.Rmd",
   
-  "dl_regression.Rmd",
+  "dl_preface.Rmd",
   "dl_classification.Rmd",
-  "dl_summarizing.Rmd",
-  "dl_clustering.Rmd",
+  "dl_regression.Rmd",
   
-  "software.Rmd",
+  "regex.Rmd",
+  "data.Rmd",
   "references.Rmd",
+
 ]

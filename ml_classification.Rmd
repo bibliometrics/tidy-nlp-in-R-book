@@ -1,1 +1,1210 @@
-# Classification
+# Classification {#mlclassification}
+
+```{r setup, include = FALSE}
+library(knitr)
+opts_chunk$set(message = FALSE, warning = FALSE, cache = FALSE, 
+               tidy = "styler", fig.width = 8, fig.height = 5)
+suppressPackageStartupMessages(library(tidyverse))
+theme_set(theme_light())
+
+# Controls caching
+online <- TRUE
+```
+
+In the previous chapter, we focused on modeling to predict *continuous values* for documents, such as what year a Supreme Court opinion was published. This is an example of a regression model. We can also use machine learning to predict *labels* on documents using a classification model. For example, let's consider the dataset of consumer complaints submitted to the US Consumer Finance Protection Bureau. Let's read in the complaint data (Appendix \@ref(us-consumer-finance-complaints)) with `read_csv()`.
+
+```{r complaints, message=FALSE}
+library(textrecipes)
+library(tidymodels)
+library(tidytext)
+library(stringr)
+library(discrim)
+library(readr)
+
+complaints <- read_csv("data/complaints.csv.gz")
+```
+
+We can start by taking a quick `glimpse()` at the data to see what we have to work with. This dataset contains a text field with the complaint, along with information regarding what it was for,
+how and when it was filed, and the response from the bureau. 
+
+```{r, dependson="complaints"}
+glimpse(complaints)
+```
+
+
+In this chapter, we will build classification models to predict what type of financial `product` the complaints are referring to, i.e., a label or categorical variable. 
+
+## A first classification model {#classfirstattemptlookatdata}
+
+For our first model, let's build a binary classification model to predict whether a submitted complaint is about "Credit reporting, credit repair services, or other personal consumer reports" or not. 
+
+```{block, type = "rmdnote"}
+This kind of "yes or no" binary classification model is both common and useful in real-world text machine learning problems.
+```
+
+The outcome variable `product` contains more categories than this, so we need to transform this variable to only contains the values "Credit reporting, credit repair services, or other personal consumer reports" and "Other".
+
+It is always a good idea to look at your data, as much as possible. Here are the first six complaints:
+
+```{r, dependson="complaints"}
+head(complaints$consumer_complaint_narrative)
+```
+
+The complaint narratives contain many series of capital `"X"`'s. These strings (like "XX/XX" or "XXXX XXXX XXXX XXXX") are used to to protect personally identifiable information (PII) in this publicly available dataset. This is not a universal censoring mechanism; censoring and PII protection will vary from source to source. Hopefully you will be able to find information on PII censoring in a data dictionary, but you should always look at the data yourself to verify. 
+
+We also see that monetary amounts are surrounded by curly brackets (like `"{$21.00}"`); this is another text preprocessing step that has been taken care of for us. We can craft a regular expression to extract all the dollar amounts.
+
+```{r, dependson="complaints"}
+complaints$consumer_complaint_narrative %>%
+  str_extract_all("\\{\\$[0-9\\.]*\\}") %>%
+  compact() %>%
+  head()
+```
+
+
+### Building our first classification model {#classfirstmodel}
+
+We are building a model from a dataset that includes annotations and labels added by the CFPB, but we need to ensure that only information that would be available at the time of prediction is included in the model.
+Otherwise we we will be very disappointed once our model is used to predict on new data!
+The variables we identify as available for use as predictors are:
+
+- `date_received`
+- `issue`
+- `sub_issue`
+- `consumer_complaint_narrative`
+- `company`
+- `state`
+- `zip_code`
+- `tags`
+- `submitted_via`
+
+To start, we will include `date_received` for our modeling, along with the text variable `consumer_complaint_narrative` and `tags`.
+The `submitted_via` variable could have been a viable candidate, but all the entries are "web".
+The other variables like ZIP code could be of use too, but they are categorical variables with many values so we will exclude them for now.
+
+
+Let's start by creating a factor outcome variable `product` with two levels, "Credit" and "Other".
+Then, we split the data into training and testing datasets.
+We can use the `initial_split()` function from **rsample** to create this binary split of the data. 
+The `strata` argument ensures that the distribution of `product` is similar in the training set and testing set. 
+Since the split uses random sampling, we set a seed so we can reproduce our results.
+
+```{r, complaintssplit}
+set.seed(1234)
+complaints2class <- complaints %>%
+  mutate(product = factor(if_else(product == "Credit reporting, credit repair services, or other personal consumer reports", "Credit", "Other")))
+
+complaints_split <- initial_split(complaints2class, strata = product)
+
+complaints_train <- training(complaints_split)
+complaints_test <- testing(complaints_split)
+```
+
+The dimensions of the two splits show that this first step worked successfully.
+
+```{r, dependson="complaintssplit"}
+dim(complaints_train)
+dim(complaints_test)
+```
+
+Next we need to do some model preprocessing, because the models we want to use only support numeric data. We have text data, and we need to build numeric features for machine learning from that text.
+
+```{block, type = "rmdwarning"}
+Some models are able to handle factor variables and missing data, but it may be in your best interest to manually specify how to preprocess your data so you know how such issues are handled.
+```
+
+The **recipes** package allows us to create a specification of preprocessing steps we want to perform. These transformations are estimated (or "trained") on the training set so that they can be applied in the same way for the testing set, without data leakage.
+We initialize our set of preprocessing transformations with the `recipe()` function, using a formula expression to specify the variables plus the dataset.
+
+```{r complaintrec1, dependson="complaintssplit"}
+complaints_rec <- 
+  recipe(product ~ date_received + tags + consumer_complaint_narrative, 
+         data = complaints_train)
+```
+
+Let's start with the `date_received` variable. We can use the `step_date()` function to extract the month and day of the week (`"dow"`). Then we remove the original date variable and convert the new month and day-of-the-week columns to indicator variables with `step_dummy()`.
+
+```{block, type = "rmdnote"}
+Categorical variables like the month can be stored as strings or factors, but for some kinds of models, they must be converted to indicator or dummy variables. These are numeric binary variables for the levels of the original categorical variable. For example, a variable called `December` would be created that is all zeroes and ones specifying which complaints were submitted in December, plus a variable called `November`, a variable called `October`, and so on.
+```
+
+
+```{r complaintrec2, dependson="complaintrec1"}
+complaints_rec <- complaints_rec %>%
+  step_date(date_received, features = c("month", "dow"), role = "dates") %>%
+  step_rm(date_received) %>%
+  step_dummy(has_role("dates"))
+```
+
+The `tags` variable has some missing data. We can deal with this by using `step_unknown()`, which adds a new level to this factor variable for cases of missing data. Then we "dummify" (create dummy/indicator variables) the variable with `step_dummy()`
+
+```{r complaintrec3, dependson="complaintrec2"}
+complaints_rec <- complaints_rec %>%
+  step_unknown(tags) %>%
+  step_dummy(tags)
+```
+
+Now we come to dealing with the text of the complaints; we use **textrecipes** to handle the `consumer_complaint_narrative` variable. First we tokenize the text to words with `step_tokenize()`. By default this uses `tokenizers::tokenize_words()`.
+Next we remove stop words with `step_stopwords()`; the default choice is the Snowball stop word list, but custom lists can be provided too. Before we calculate the tf-idf we use `step_tokenfilter()` to only keep the 500 most frequent tokens, to avoid creating too many variables. To finish, we use `step_tfidf()` to compute tf-idf.
+
+```{r complaintrec4, dependson="complaintrec3"}
+complaints_rec <- complaints_rec %>%
+  step_tokenize(consumer_complaint_narrative) %>%
+  step_stopwords(consumer_complaint_narrative) %>%
+  step_tokenfilter(consumer_complaint_narrative, max_tokens = 500) %>%
+  step_tfidf(consumer_complaint_narrative)
+```
+
+Now that we have a full specification of the preprocessing recipe, we can `prep()` this recipe to estimate all the necessary parameters for each step using the training data. 
+
+```{r complaintprep, dependson="complaintrec4"}
+complaint_prep <- prep(complaints_rec)
+```
+
+For most modeling tasks, you will not need to `prep()` your recipe directly; instead you can build up a tidymodels `workflow()` to bundle together your modeling components.
+
+```{r complaintwf, dependson="complaintrec4"}
+complaint_wf <- workflow() %>%
+  add_recipe(complaints_rec)
+```
+
+Let's start with a naive Bayes model [@kim2006, @Kibriya2005, @Eibe2006].
+One of the main advantages of a naive Bayes model is its ability to handle a large number of features, such as those we deal with when using word count methods.
+Here we have only kept the 500 most frequent tokens, but we could have kept more tokens and a naive Bayes model would be able to handle it well. For now, we will limit the model to a moderate number of tokens.
+
+```{r nbspec}
+nb_spec <- naive_Bayes() %>%
+  set_mode("classification") %>%
+  set_engine("naivebayes")
+
+nb_spec
+```
+
+Now we have everything we need to fit our first classification model. We can add the naive Bayes model to our workflow, and then we can fit this workflow to our training data.
+
+```{r nbfit, dependson=c("nbspec", "complaintwf")}
+nb_fit <- complaint_wf %>%
+  add_model(nb_spec) %>%
+  fit(data = complaints_train)
+```
+
+We have trained our first classification model!
+
+### Evaluation
+
+Like we discussed in Section \@ref(firstregressionevaluation), we can't use the test set to compare models or different model parameters. The test set is a precious resource that can only be used at the end of the model training process to estimate performance on new data. Instead, we will use **resampling** to evaluate our model.
+
+Let's use resampling to estimate the performance of the naive Bayes classification model we just fit. We can do this using resampled datasets built from the training set. Let's create cross 10-fold cross-validation sets, and use these resampled sets for performance estimates.
+
+```{r complaintsfolds, dependson="complaintssplit"}
+complaints_folds <- vfold_cv(complaints_train)
+
+complaints_folds
+```
+
+Each of these splits contains information about how to create cross-validation folds from the original training data. In this example, 90% of the training data is included in each fold and the other 10% is held out for evaluation.
+
+For convenience, let's again use a `workflow()` for our resampling estimates of performance.
+
+```{r nbwf, dependson=c("nbspec", "complaintrec4")}
+nb_wf <- workflow() %>%
+  add_recipe(complaints_rec) %>%
+  add_model(nb_spec)
+
+nb_wf
+```
+
+In the last section, we fit one time to the training data as a whole. Now, to estimate how well that model performs, let's fit the model many times, once to each of these resampled folds, and then evaluate on the heldout part of each resampled fold.
+
+```{r nbrs, dependson=c("nbwf", "complaintsfolds"), eval = !online}
+nb_rs <- fit_resamples(
+  nb_wf,
+  complaints_folds,
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+We can extract the relevant information using `collect_metrics()` and `collect_predictions()`
+
+```{r nbrsmetrics, eval = !online}
+nb_rs_metrics <- collect_metrics(nb_rs)
+nb_rs_predictions <- collect_predictions(nb_rs)
+```
+
+```{r, include = FALSE, eval = !online}
+write_rds(nb_rs_metrics, "data/ml_class_first_nb_rs_metrics.rds")
+write_rds(nb_rs_predictions, "data/ml_class_first_nb_rs_predictions.rds")
+```
+
+```{r, include = FALSE, eval = online}
+nb_rs_metrics <- read_rds("data/ml_class_first_nb_rs_metrics.rds")
+nb_rs_predictions <- read_rds("data/ml_class_first_nb_rs_predictions.rds")
+```
+
+What results do we see, in terms of performance metrics?
+
+```{r}
+nb_rs_metrics
+```
+
+The default performance parameters for binary classification are accuracy and ROC AUC (area under the receiver operator curve). The accuracy is the percentage of accurate predictions. For these resamples, the average accuracy is `r nb_rs_metrics %>% filter(.metric == "accuracy") %>% pull(mean) %>% scales::percent_format(accuracy = 0.1)()`.
+
+```{block, type = "rmdnote"}
+For both accuracy and ROC AUC, values closer to 1 are better.
+```
+
+The [receiver operator curve](https://en.wikipedia.org/wiki/Receiver_operating_characteristic) is a plot that shows the sensitivity at different thresholds. It demonstrates how well a classification model can distinguish between classes. Figure \@ref(fig:firstroccurve) shows the ROC curve for our first classification model on each of the resampled datasets.
+
+```{r firstroccurve, fig.width=7, fig.height=6, fig.cap="ROC curve for resamples of US Consumer Finance Bureau complaints"}
+nb_rs_predictions %>%
+  group_by(id) %>%
+  roc_curve(truth = product, .pred_Credit) %>%
+  autoplot() +
+  labs(
+    color = NULL,
+    title = "Receiver operator curve for US Consumer Finance Complaints",
+    subtitle = "Each resample fold is shown in a different color"
+  )
+```
+
+The area under each of these curves is the `roc_auc` metric we have computed. If the curve was close to the diagonal line, then the model's predictions would be no better than random guessing.
+
+Another way to evaluate our model is to evaluate the [confusion matrix](https://en.wikipedia.org/wiki/Confusion_matrix). A confusion matrix visualizes a model's false positives and false negatives for each class.
+There is not a trivial way to visualize multiple confusion matrices, so we can look at them individually for a single fold.
+
+```{r firstheatmap, dependson="nbrs", fig.cap="Confusion matrix for first naive Bayes classifier, showing some bias towards predicting 'Credit'"}
+nb_rs_predictions %>%
+  filter(id == "Fold01") %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+In Figure \@ref(fig:firstheatmap), the diagonal squares have darker shades than the off diagonal squares. This is a good sign meaning that our model is right more often then not. However, the model still appears to be struggling since it is more or less at even odds when predicting something from the "Other" class.
+
+```{block, type = "rmdwarning"}
+One metric alone cannot give you a complete picture of how well your classification model is performing. The confusion matrix is a good starting point to get an overview of your model performance as it includes rich information.
+```
+
+Let's move forward and improve this first model.
+
+## Compare to a SVM model {#comparetosvm}
+
+[Support Vector Machines](https://en.wikipedia.org/wiki/Support_vector_machine) are a class of machine learning model that can be used in regression and classification tasks. While they don't see widespread use in the general machine learning space today, they have properties that make them suitable for text classification [@Joachims1998] and can give good performance [@Vantu2016].
+
+Let's create a specification of an SVM model with a radial basis function as the kernel. 
+
+```{r svmspec}
+svm_spec <- svm_rbf() %>%
+  set_mode("classification") %>%
+  set_engine("liquidSVM")
+
+svm_spec
+```
+
+Then we can create another `workflow()` object with the SVM specification. Notice that we can reuse our model preprocessing recipe.
+
+```{r svmwf, dependson=c("svmspec", "complaintrec4")}
+svm_wf <- workflow() %>%
+  add_recipe(complaints_rec) %>%
+  add_model(svm_spec)
+```
+
+The **liquidSVM** engine doesn't support class probabilities so we need to replace the default metric set with a metric set that doesn't use class probabilities. Here we use accuracy, [sensitivity](https://en.wikipedia.org/wiki/Sensitivity_and_specificity#Sensitivity), and [specificity](https://en.wikipedia.org/wiki/Sensitivity_and_specificity#Specificity).
+
+```{r svmrs, dependson=c("svmwf", "complaintsfolds"), eval = !online}
+svm_rs <- fit_resamples(
+  svm_wf,
+  complaints_folds,
+  metrics = metric_set(accuracy, sensitivity, specificity),
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+Let's again extract the relevant information using `collect_metrics()` and `collect_predictions()`
+
+```{r svmrsmetrics, eval = !online}
+svm_rs_metrics <- collect_metrics(svm_rs)
+svm_rs_predictions <- collect_predictions(svm_rs)
+```
+
+```{r, include = FALSE, eval = !online}
+write_rds(svm_rs_metrics, "data/ml_class_first_svm_rs_metrics.rds")
+write_rds(svm_rs_predictions, "data/ml_class_first_svm_rs_predictions.rds")
+```
+
+```{r, include = FALSE, eval = online}
+svm_rs_metrics <- read_rds("data/ml_class_first_svm_rs_metrics.rds")
+svm_rs_predictions <- read_rds("data/ml_class_first_svm_rs_predictions.rds")
+```
+
+Now we can see that `svm_rs_metrics` contains the three performance metrics we chose for the SVM model.
+
+```{r, dependson="svmrsmetrics"}
+svm_rs_metrics
+```
+
+This looks pretty promising, considering we didn't do any hyperparameter tuning on the model parameters.
+Let's finish this section by generating a confusion matrix, shown in Figure \@ref(fig:svmheatmap).
+Our SVM model is much better at separating the classes then the naive Bayes model in Section \@ref(classfirstmodel), and our results are much more symmetrical than those for the naive Bayes model in Figure \@ref(fig:firstheatmap).
+
+```{r svmheatmap, dependson="svmrsmetrics", fig.cap="Confusion matrix for a simple Support Vector Machine classifier, with more symmetric results"}
+svm_rs_predictions %>%
+  filter(id == "Fold01") %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+One of the main benefits of a Support Vector Machine model is its support for sparse data, making this algorithm a great match for text data. Support Vector Machine models generally also perform well with large datasets (thousands of columns), which are again quite characteristic of text data.
+
+## Two class or multiclass? {#mlmulticlass}
+
+Most of this chapter focuses on [binary classification](https://en.wikipedia.org/wiki/Binary_classification), where we have two classes in our outcome variable (such as "Credit" and "Other") and each observation can either be one or the other. This is a simple scenario with straightforward evaluation strategies because the results only have a two-by-two contingency matrix.
+However, it is not always possible to limit a modeling question to two classes. Let's explore how to deal with situations where we have more then two classes.
+The CFPB complaints dataset we have been working with has nine different `product` classes. In decreasing frequency, they are:
+
+- Credit reporting, credit repair services, or other personal consumer reports
+- Debt collection
+- Credit card or prepaid card
+- Mortgage
+- Checking or savings account
+- Student loan
+- Vehicle loan or lease
+- Money transfer, virtual currency, or money service
+- Payday loan, title loan, or personal loan
+
+We assume that there is a reason why these product classes have been created in this fashion by this government agency.
+Perhaps complaints from different classes are handled by different people or organizations.
+Whatever the reason, we would like to build a multiclass classifier to identify these nine specific product classes.
+
+We need to create a new split of the data using `initial_split()` on the unmodified `complaints` dataset.
+
+```{r, multicomplaintssplit}
+set.seed(1234)
+
+multicomplaints_split <- initial_split(complaints, strata = product)
+
+multicomplaints_train <- training(multicomplaints_split)
+multicomplaints_test <- testing(multicomplaints_split)
+```
+
+Before we continue, let us take a look at the number of cases in each of the classes.
+
+```{r, dependson="multicomplaintssplit"}
+multicomplaints_train %>% 
+  count(product, sort = TRUE) %>% 
+  select(n, product)
+```
+
+There is significant imbalance between the classes that we must address, with over twenty times more cases of the majority class then there is of the smallest class.
+This kind of imbalance is a common problem with multiclass classification, with few multiclass datasets in the real world exhibiting balance between classes.
+
+Compared to binary classification, there are several additional issues to keep in mind when working with multiclass classification:
+
+- Many machine learning algorithms do not handle imbalanced data well and are likely to have a hard time predicting minority classes.
+- Not all machine learning algorithms are built for multiclass classification at all.
+- Many evaluation metrics need to be reformulated to describe multiclass predictions.
+
+When you have multiple classes in your data, it is possible to formulate the multiclass problem in two ways. With one approach, any given observation can belong to multiple classes. With the other approach, an observation can belong to one and only one class. We will be sticking to the second, "one class per observation" model formulation in this section.
+
+There are many different ways to deal with imbalanced data.
+We will demonstrate one of the simplest methods, downsampling, where observations from the majority classes are removed during training to achieve a balanced class distribution.
+We will be using the [themis](https://github.com/tidymodels/themis) add-on package for recipes which provides the [step_downsample()](https://tidymodels.github.io/themis/reference/step_downsample.html) function to perform downsampling.
+
+```{block, type = "rmdnote"}
+The themis package provides many more algorithms to deal with imbalanced data.
+```
+
+We have to create a new recipe specification from scratch, since we are dealing with new training data this time.
+The specification `multicomplaints_rec` is similar to what we created in Section \@ref(classfirstattemptlookatdata). The only changes are that different data is passed to the `data` argument in the `recipe()` function (it is now `multicomplaints_train`) and we have added `step_downsample(product)` to the end of the recipe specification to downsample after all the text preprocessing. We want to downsample last so that we still generate features on the full training dataset. The downsampling will then only affect the modeling step (not the preprocessing steps), with hopefully better results.
+
+```{r multicomplaintsrec, message=FALSE, dependson="multicomplaintssplit"}
+library(themis)
+
+multicomplaints_rec <- 
+  recipe(product ~ date_received + tags + consumer_complaint_narrative, 
+         data = multicomplaints_train) %>%
+  step_date(date_received, features = c("month", "dow"), role = "dates") %>%
+  step_rm(date_received) %>%
+  step_dummy(has_role("dates")) %>%
+  step_unknown(tags) %>%
+  step_dummy(tags) %>%
+  step_tokenize(consumer_complaint_narrative) %>%
+  step_stopwords(consumer_complaint_narrative) %>%
+  step_tokenfilter(consumer_complaint_narrative, max_tokens = 500) %>%
+  step_tfidf(consumer_complaint_narrative) %>%
+  step_downsample(product)
+```
+
+We also need a new cross-validation object since we are using a different dataset.
+
+```{r multicomplaintsfolds, dependson="complaintssplit"}
+multicomplaints_folds <- vfold_cv(multicomplaints_train)
+```
+
+We can reuse the Support Vector Machine specification from Section \@ref(comparetosvm) to create a new workflow object with the new recipe specification.
+The SVM algorithm is specified for binary classification, but extensions have been made to generalize it to multiclass cases. The liquidSVM method will automatically detect that we are performing multiclass classification and switch to the appropriate case.
+
+```{r multisvmwf, dependson=c("svmspec", "multicomplaintsrec")}
+multi_svm_wf <- workflow() %>%
+  add_recipe(multicomplaints_rec) %>%
+  add_model(svm_spec)
+
+multi_svm_wf
+```
+
+```{block, type = "rmdnote"}
+Notice that you don't have to specify anything to perform multiclass classification in this case. The modeling packages will infer this from the number of classes in the outcome variable.
+```
+
+Now we have everything we need for `fit_resamples()` to fit all the models. Note that we specify `save_pred = TRUE`, so we can create a confusion matrix later. This is especially beneficial for multiclass classification.
+We again specify the `metric_set()` since liquidSVM doesn't support class probabilities.
+
+```{r multisvmrs, dependson=c("multisvmwf", "multicomplaintsrec"), eval= !online}
+multi_svm_rs <- fit_resamples(
+  multi_svm_wf,
+  multicomplaints_folds,
+  metrics = metric_set(accuracy),
+  control = control_resamples(save_pred = TRUE)
+)
+
+multi_svm_rs
+```
+
+Let's again extract the relevant results using `collect_metrics()` and `collect_predictions()`
+
+```{r multisvmrsmetrics, dependson="multisvmrs", eval = !online}
+multi_svm_rs_metrics <- collect_metrics(multi_svm_rs)
+multi_svm_rs_predictions <- collect_predictions(multi_svm_rs)
+```
+
+```{r, include = FALSE, eval = !online}
+write_rds(multi_svm_rs_metrics, "data/ml_class_first_multi_svm_rs_metrics.rds")
+write_rds(multi_svm_rs_predictions, "data/ml_class_first_multi_svm_rs_predictions.rds")
+```
+
+```{r, include = FALSE, eval = online}
+multi_svm_rs_metrics <- read_rds("data/ml_class_first_multi_svm_rs_metrics.rds")
+multi_svm_rs_predictions <- read_rds("data/ml_class_first_multi_svm_rs_predictions.rds")
+```
+
+What do we see, in terms of performance metrics?
+
+```{r}
+multi_svm_rs_metrics
+```
+
+The accuracy metric naturally extends to multiclass tasks, but it appears quite low at `r multi_svm_rs_metrics %>% filter(.metric == "accuracy") %>% pull(mean) %>% scales::percent_format(accuracy = 0.1)()`, significantly lower than for the binary case in Section \@ref(comparetosvm). This is expected since multiclass classification is a harder task than binary classification. In binary classification, there is one right answer and one wrong answer; in this case, there is one right answer and _eight_ wrong answers.
+
+To get a more detailed view of how our classifier is performing, let us look at one of the confusion matrices in Figure \@ref(fig:multiheatmap).
+
+```{r multiheatmap, fig.cap="Confusion matrix for multiclass Support Vector Machine classifier, with most of the classifications along the diagonal", fig.width=10, fig.height=8}
+multi_svm_rs_predictions %>%
+  filter(id == "Fold01") %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_y_discrete(labels = function(x) str_wrap(x, 20)) +
+  scale_x_discrete(labels = function(x) str_wrap(x, 20))
+```
+
+The diagonal is fairly well populated, which is a good sign. This means that the model generally predicted the right class.
+The off-diagonals numbers are all the failures and where we should direct our focus.
+It is a little hard to see these cases well since the majority class affects the scale.
+A trick to deal with this problem is to remove all the correctly predicted observations.
+
+```{r multiheatmapminusdiag, fig.cap="Confusion matrix for multiclass Support Vector Machine classifier without diagonal", fig.width=10, fig.height=8}
+multi_svm_rs_predictions %>%
+  filter(id == "Fold01") %>%
+  filter(.pred_class != product) %>%
+  conf_mat(product, .pred_class) %>%
+  autoplot(type = "heatmap") +
+  scale_y_discrete(labels = function(x) str_wrap(x, 20)) +
+  scale_x_discrete(labels = function(x) str_wrap(x, 20))
+```
+
+Now we can more clearly see where our model breaks down in Figure \@ref(fig:multiheatmapminusdiag). One of the most common errors is "Credit reporting, credit repair services, or other personal consumer reports" complaints being wrongly being predicted as "Credit card or prepaid card" complaints. That is not hard to understand since both deal with credit and do have overlap in vocabulary.
+Knowing what the problem is helps us figure out how to improve our model.
+The first step for improving our model is to revisit the data preprocessing steps and model selection.
+We can look at different models or model engines that might be able to more easily separate the classes. The `svm_rbf()` model has a `cost` argument that determines the penalization of wrongly predicted classes that might be worth looking at.
+
+Now that we have an idea of where the model isn't working, we can look more closely at the data to create features that could distinguish between these classes. In Section \@ref(customfeatures) will we demonstrate how you can create custom features.
+
+## Case study: data censoring
+
+The complaints dataset already has sensitive information (PII) censored or protected using strings such as "XXXX" and "XX".
+This data censoring can be viewed as data _annotation_; specific account numbers and birthdays are protected but we know they were there. These values would be mostly unique anyway, and likely filtered out in their original form.
+
+Figure \@ref(fig:censoredtrigram) shows the most frequent trigrams (Section \@ref(tokenizingngrams)) in our training dataset.
+
+```{r censoredtrigram, dependson="complaintssplit", fig.cap="Many of the most frequent trigrams feature censored information"}
+complaints_train %>%
+  slice(1:1000) %>%
+  unnest_tokens(trigrams, consumer_complaint_narrative, token = "ngrams", 
+                collapse = FALSE) %>%
+  count(trigrams, sort = TRUE) %>%
+  mutate(censored = str_detect(trigrams, 'xx')) %>%
+  slice(1:20) %>%
+  ggplot(aes(n, reorder(trigrams, n), fill = censored)) +
+  geom_col() +
+  scale_fill_manual(values = c("grey40", "firebrick")) +
+  labs(y = "Trigrams", x = "Count")
+```
+
+The vast majority of trigrams in Figure \@ref(fig:censoredtrigram) include one or more censored words.
+Not only do the most used trigrams include some kind of censoring, 
+but the censoring itself is informative as it is not used uniformly across the product classes.
+In Figure \@ref(fig:trigram25), we take the top 25 most frequent trigrams that include censoring,
+and plot the proportions for "Credit" and "Other".
+
+```{r trigram25, fig.cap="Many of the most frequent trigrams feature censored words, but there is a difference in how often they are used within each class"}
+top_censored_trigrams <- complaints_train %>%
+    slice(1:1000) %>%
+  unnest_tokens(trigrams, consumer_complaint_narrative, token = "ngrams", 
+                collapse = FALSE) %>%
+  count(trigrams, sort = TRUE) %>%
+  filter(str_detect(trigrams, 'xx')) %>%
+  slice(1:25)
+
+plot_data <- complaints_train %>%
+  unnest_tokens(trigrams, consumer_complaint_narrative, token = "ngrams", 
+                collapse = FALSE) %>%
+  right_join(top_censored_trigrams, by = "trigrams") %>%
+  count(trigrams, product, .drop = FALSE) 
+
+plot_data %>%
+  ggplot(aes(n, trigrams, fill = product)) +
+  geom_col(position = "fill")
+```
+
+There is a difference in these proportions across classes. Tokens like "on xx xx" and "of xx xx" are used when referencing a date, e.g., "we had a problem on 06/25/2018".
+Remember that the current tokenization engine strips punctuation before tokenizing. 
+This means that the above example will be turned into "we had a problem on 06 25 2018" before creating n-grams.
+
+To crudely simulate what the data might look like before it was censored, we can replace all cases of "XX" and "XXXX" with random integers. 
+This isn't quite right since dates will be given values between `00` and `99` and we don't know for sure that only numerals have been censored, but it gives us a place to start.
+Below is a simple function `uncensor_vec()` that locates all instances of `"XX"` and replaces them with a number between 11 and 99.
+We don't need to handle the special case of `XXXX` as it automatically being handled.
+
+```{r uncensor_vec}
+uncensor <- function(n) {
+  as.character(sample(seq(10 ^ (n - 1), 10 ^ n - 1), 1))
+}
+
+uncensor_vec <- function(x) {
+  locs <- str_locate_all(x, "XX")
+  
+  map2_chr(x, locs, ~ {
+    for (i in seq_len(nrow(.y))) {
+      str_sub(.x, .y[i, 1], .y[i, 2]) <- uncensor(2)
+    }
+    .x
+  })
+}
+```
+
+We can run a quick test to see how it works.
+
+```{r, dependson="uncesor_vec"}
+uncensor_vec("In XX/XX/XXXX I leased a XXXX vehicle")
+```
+
+Now we can produce the same visualization as Figure \@ref(fig:censoredtrigram) but also applying our uncensoring function to the text before tokenizing.
+
+```{r uncensoredtrigram, dependson=c("complaintssplit", "uncensor_vec"), fig.cap="Trigrams without numbers float to the top as the uncensored tokens are too spread out"}
+complaints_train %>%
+    slice(1:1000) %>%
+  mutate(text = uncensor_vec(consumer_complaint_narrative)) %>%
+  unnest_tokens(trigrams, text, token = "ngrams", 
+                collapse = FALSE) %>%
+  count(trigrams, sort = TRUE) %>%
+  mutate(censored = str_detect(trigrams, 'xx')) %>%
+  slice(1:20) %>%
+  ggplot(aes(n, reorder(trigrams, n), fill = censored)) +
+  geom_col() +
+  scale_fill_manual(values = c("grey40", "firebrick")) +
+  labs(y = "Trigrams", x = "Count")
+```
+
+Here in Figure \@ref(fig:uncensoredtrigram), we see the same trigrams that appeared in Figure \@ref(fig:censoredtrigram).
+However, none of the uncensored words appear, because of our uncensoring function.
+This is expected, because while `"xx xx 2019"` appears in the first plot indicating a date in the year 2019, after we uncensor it, it is split into 365 buckets (actually more, since we used numerical values between `00` and `99`).
+Censoring the dates in these complaints gives more power to a date as a general construct.
+
+```{block, type = "rmdwarning"}
+What happens when we use these censored dates as a feature in supervised machine learning? We have a higher chance of understanding if dates in the complaint text are important to predicting the class, but we are blinded to the possibility that certain dates and months are more important.
+```
+
+Data censoring can be a form of preprocessing in your data pipeline.
+For example, it is highly unlikely to be useful (or ethical/legal) to have any specific person's social security number, credit card number, or any other kind of PII embedded into your model.
+Such values appear rarely and are most likely highly correlated with other known variables in your dataset.
+More importantly, that information can become embedded in your model and begin to leak as demonstrated by @carlini2018secret, @Fredrikson2014, and @Fredrikson2015.
+Both of these issues are important, and one of them could land you in a lot of legal trouble. 
+
+If you have social security numbers in text data, you should definitely not pass them on to your machine learning model, but you may consider the option of annotating the _presence_ of a social security number. 
+Since a social security number has a very specific form, we can easily construct a regular expression (Appendix \@ref(regexp)) to locate them.
+
+```{block, type = "rmdnote"}
+A social security number comes in the form `AAA-BB-CCCC` where `AAA` is a number between `001` and `899` excluding `666`, `BB` is a number between `01` and `99` and `CCCC` is a number between `0001` and `9999`. This gives us the following regex:
+
+`(?!000|666)[0-8][0-9]{2}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}`
+```
+
+We can use a function to replace each social security number with an indicator that can be detected later by preprocessing steps. 
+It's a good idea to use a "word" that won't be accidentally broken up by a tokenizer.
+
+```{r}
+ssn_text <- c("My social security number is 498-08-6333",
+              "No way, mine is 362-60-9159", 
+              "My parents numbers are 575-32-6985 and 576-36-5202")
+
+ssn_pattern <-  "(?!000|666)[0-8][0-9]{2}-(?!00)[0-9]{2}-(?!0000)[0-9]{4}"
+
+str_replace_all(string = ssn_text, 
+                pattern = ssn_pattern,
+                replacement = "ssnindicator")
+```
+
+This technique isn't useful only for personally identifiable information but can be used anytime you want to gather similar words in the same bucket; hashtags, email addresses, and usernames can sometimes benefit from being annotated in this way.
+
+## Case study: custom features {#customfeatures}
+
+Most of what we have looked at so far has boiled down to counting tokens and weighting them in one way or another.
+This approach is quite broad and domain agnostic, but you as a data practitioner often have specific knowledge about your dataset that you should use in feature engineering.
+Your domain knowledge allows you to build more predictive features than the naive search of simple tokens.
+As long as you can reasonably formulate what you are trying to count, chances are you can write a function that can detect it.
+This is where having a little bit of regular expressions knowledge pays off.
+
+```{block, type = "rmdnote"}
+The [textfeatures](https://github.com/mkearney/textfeatures) package includes functions to extract useful features from text, from the number of digits to the number of second person pronouns and more. These features can be used in textrecipes data preprocessing with the `step_textfeature()` function.
+```
+
+Your specific domain knowledge may provide specific guidance about feature engineering for text.
+Such custom features can be simple such as the number of URLs or the number of punctuation marks.
+They can also be more engineered such as the percentage of capitalization, whether the text ends with a hashtag, or whether two people's names are both mentioned in a document.
+
+For our CFPB complaints data, certain patterns have not adequately been picked up by our model so far, such as the data censoring and the curly bracket annotation for monetary amounts that we saw in Section \@ref(classfirstattemptlookatdata). Let's walk through how to create data preprocessing functions to build the features to:
+
+- detect credit cards,
+- calculate percentage censoring, and
+- detect monetary amounts.
+
+### Detect credit cards
+
+A credit card number is represented as four groups of four capital Xs in this dataset.
+Since the data is fairly well processed we are fairly sure that spacing will not be an issue and all credit cards will be represented as "XXXX XXXX XXXX XXXX". 
+A first naive attempt may be to use `str_detect()` with "XXXX XXXX XXXX XXXX" to find all the credit cards.
+
+```{block, type = "rmdnote"}
+It is a good idea to create a small example regular expression where you know the answer, and then prototype your function before moving to the main dataset.
+```
+
+We start by creating a vector with two positives, one negative, and one potential false positive.
+The last string is more tricky since it has the same shape as a credit card but has one too many groups.
+
+```{r}
+credit_cards <- c("my XXXX XXXX XXXX XXXX balance, and XXXX XXXX XXXX XXXX.",
+                  "card with number XXXX XXXX XXXX XXXX.",
+                  "at XX/XX 2019 my first",
+                  "live at XXXX XXXX XXXX XXXX XXXX SC")
+
+
+str_detect(credit_cards, "XXXX XXXX XXXX XXXX")
+```
+
+As we feared, the last vector was falsely detected to be a credit card.
+Sometimes you will have to accept a certain number of false positives and/or false negatives, depending on the data and what you are trying to detect. 
+In this case, we can make the regex a little more complicated to avoid that specific false positive.
+We need to make sure that the word coming before the X's doesn't end in a capital X and the word following the last X doesn't start with a capital X.
+We place spaces around the credit card and use some negated character classes (Appendix \@ref(character-classes)) to detect anything BUT a capital X.
+
+```{r}
+str_detect(credit_cards, "[^X] XXXX XXXX XXXX XXXX [^X]")
+```
+
+Hurray! This fixed the false positive. 
+But it gave us a false negative in return.
+Turns out that this regex doesn't allow the credit card to be followed by a period since it requires a space.
+We can fix this with an alteration to match for a period or a space and a non-X.
+
+```{r}
+str_detect(credit_cards, "[^X] +XXXX XXXX XXXX XXXX(\\.| [^X])")
+```
+
+Now that we have a regular expression we are happy with we can wrap it up in a function we can use.
+We can extract the presence of a credit card with `str_detect()` and the number of credit cards with `str_count()`.
+
+```{r}
+creditcard_indicator <- function(x) {
+  str_detect(x, "[^X] +XXXX XXXX XXXX XXXX(\\.| [^X])")
+}
+
+creditcard_count <- function(x) {
+  str_count(x, "[^X] +XXXX XXXX XXXX XXXX(\\.| [^X])")
+}
+
+creditcard_indicator(credit_cards)
+creditcard_count(credit_cards)
+```
+
+### Calculate percentage censoring
+
+Some of the complaints contain a high proportion of censoring, and we can build a feature to measure the percentage of the text that is censored.
+
+```{block, type = "rmdwarning"}
+There are often many ways to get to the same solution when working with regular expressions.
+```
+
+Let's attack this problem by counting the number of X's in each string, then count the number of alphanumeric characters and divide the two to get a percentage.
+
+```{r}
+str_count(credit_cards, "X")
+str_count(credit_cards, "[:alnum:]")
+str_count(credit_cards, "X") / str_count(credit_cards, "[:alnum:]")
+```
+
+We can finish up by creating a function.
+
+```{r}
+procent_censoring <- function(x) {
+  str_count(x, "X") / str_count(x, "[:alnum:]")
+}
+
+procent_censoring(credit_cards)
+```
+
+### Detect monetary amounts
+
+We have already constructed a regular expression that detects the monetary amount from the text in Section \@ref(classfirstattemptlookatdata), so now we can look at how to use this information.
+Let's start by creating a little example and see what we can extract.
+
+```{r}
+dollar_texts <- c("That will be {$20.00}",
+                  "{$3.00}, {$2.00} and {$7.00}",
+                  "I have no money")
+
+str_extract_all(dollar_texts, "\\{\\$[0-9\\.]*\\}")
+```
+
+We can create a function that simply detects the dollar amount, and we can count the number of times each amount appears.
+Each occurrence also has a value, so it would be nice to include that information as well, such as the mean, minimum, or maximum.
+
+First, let's extract the number from the strings. We could write a regular expression for this, but the `parse_number()` function from the readr package does a really good job of pulling out numbers.
+
+```{r}
+str_extract_all(dollar_texts, "\\{\\$[0-9\\.]*\\}") %>%
+  map(readr::parse_number)
+```
+
+Now that we have the numbers we can iterate over them with the function of our choice.
+Since we are going to have texts with no monetary amounts, we need to handle the case with zero numbers. Defaults for some functions with vectors of length zero can be undesirable; we don't want `-Inf` to be a value. Let's extract the maximum value and give cases with no monetary amounts a maximum of zero.
+
+```{r}
+max_money <- function(x) {
+  str_extract_all(x, "\\{\\$[0-9\\.]*\\}") %>%
+    map(readr::parse_number) %>%
+    map_dbl(~ ifelse(length(.x) == 0, 0, max(.x)))
+}
+
+max_money(dollar_texts)
+```
+
+Now that we have created some feature engineering functions, we can use them to (hopefully) make our classification model better.
+
+## Case study: feature hashing
+
+The models we have created so far have used tokenization (Chapter \@ref(tokenization)) to split apart text data into tokens that are meaningful to us as human beings (words, bigrams) and then weighted these tokens by simple counts with word frequencies or weighted counts with tf-idf.
+A problem with these methods is that the output space is vast and dynamic.
+We could easily have more than 10,000 features in our training set, and we may run into computational problems with memory or long processing times.
+Deciding how many tokens to include can become a trade-off between computational time and information.
+This style of approach also doesn't let us take advantage of new tokens we didn't see in our training data.
+
+One method that has gained popularity in the machine learning field is the **hashing trick**.
+This method addresses many of the challenges outlined above and is very fast with a low memory footprint.
+
+Let's start with the basics of feature hashing.
+First proposed by @Weinberger2009, feature hashing was introduced as a dimensionality reduction method with a simple premise.
+We being with a hashing function which we then apply to our tokens.
+
+```{block, type = "rmdwarning"}
+A hashing function takes input of variable size and maps it to output of a fixed size. Hashing functions are commonly used in cryptography.
+```
+
+We will use the hashFunction package to illustrate the behavior of hashing functions.
+Suppose we have many country names in a character vector.
+We can apply the hashing function to each of the country names to project them into an integer space defined by the hashing function.
+We will use the 32-bit version of MurmurHash3 [@appleby2008] here.
+
+```{block, type = "rmdnote"}
+Hashing functions are typically very fast and have certain properties. For example, the output of a hash function is expected to be uniform, with the whole output space filled evenly. The "avalanche effect" describes how similar strings are hashed in such a way that their hashes are not similar in the output space.
+```
+
+```{r}
+library(hashFunction)
+countries <- c("Palau", "Luxembourg", "Vietnam", "Guam", "Argentina", "Mayotte", 
+               "Bouvet Island", "South Korea", "San Marino", "American Samoa")
+
+map_int(countries, murmur3.32)
+```
+
+Since MurmurHash uses 32 bits, the number of possible values is `2^32 = 4294967296`, which is admittedly not much of an improvement over ten country names.
+Let's take the modulo of these big integer values to project them down to a more manageable space.
+
+```{r}
+map_int(countries, murmur3.32) %% 24
+```
+
+Now we can use these values as indices when creating a matrix.
+
+```{r, echo=FALSE}
+Matrix::sparseMatrix(1:10, map_int(countries, murmur3.32) %% 24, 
+                     dims = c(10, 24),
+                     dimnames = list(countries, NULL))
+```
+
+This method is very fast; both the hashing and modulo can be performed independently for each input since neither need information about the full corpus.
+Since we are reducing the space, there is a chance that multiple words are hashed to the same value.
+This is called a collision and at first glance, it seems like would be a big problem for a model.
+However, research finds that using feature hashing has roughly the same accuracy as a simple bag-of-words model and the effect of collisions is quite minor [@Forman2008].
+
+```{block, type = "rmdnote"}
+Another step that is taken to avoid the negative effects of hash collisions is to use a _second_ hashing function that returns 1 and -1. This determines if we are adding or subtracting the index we get from the first hashing function. Suppose both the words "outdoor" and "pleasant" hash to the integer value 583. Without the second hashing they would collide to 2. Using signed hashing, we have a 50% chance that they will cancel each other out, which tries to stop one feature from growing too much.
+```
+
+There are downsides to using feature hashing. Feature hashing:
+
+- still has one tuning parameter, and
+- cannot be reversed.
+
+The number of buckets you have correlates with computation speed and collision rate which in turn affects performance. 
+It is your job to find the output that best suits your needs.
+Increasing the number of buckets will decrease the collision rate but will, in turn, return a larger output dataset which increases model fitting time. 
+The number of buckets is tunable in tidymodels using the tune package.
+
+Perhaps the more important downside to using feature hashing is that the operation can't be reversed. 
+We are not able to detect if a collision occurs and it is difficult to understand the effect of any word in the model.
+Remember that we are left with `n` columns of _hashes_ (not tokens), so if we find that the 274th column is a highly predictive feature, we cannot know in general which tokens contribute to that column. 
+We could go back to our training set and create a paired list of the tokens and what hashes they map to. Sometimes we might find only one token in that list, but it may have two (or three or four or more!) different tokens contributing.
+This feature hashing method is used because of its speed and scalability, not because it is interpretable.
+
+Feature hashing on tokens is available in tidymodels using the `step_texthash()` step from textrecipes.
+
+```{r complaintshash, dependson="complaintssplit"}
+complaints_hash <- recipe(product ~ consumer_complaint_narrative, data = complaints_train) %>%
+  step_tokenize(consumer_complaint_narrative) %>%
+  step_texthash(consumer_complaint_narrative, signed = TRUE, num_terms = 512) %>%
+  prep() %>%
+  juice()
+
+dim(complaints_hash)
+```
+
+There are many columns in the results. Let's take a `glimpse()` at the first ten columns.
+
+```{r dependson="complaintshash"}
+complaints_hash %>% 
+  select(consumer_complaint_narrative_hash001:consumer_complaint_narrative_hash010) %>% 
+  glimpse()
+```
+
+By using `step_texthash()` we can quickly generate machine-ready data with a consistent number of variables.
+This typically results in a slight loss of performance compared to using a traditional bag-of-words representation. An example of this loss is illustrated in this [textrecipes blogpost](https://www.hvitfeldt.me/blog/textrecipes-series-featurehashing/).
+
+### Text normalization
+
+When working with text, you will inevitably run into problems with encodings and related irregularities.
+These kinds of problems have a significant influence on feature hashing.
+Consider the German word "schön."
+The o with an umlaut (two dots over it) is a fairly simple character but it can be represented in a couple of different ways.
+We can either use a single character [\\U00f6](https://www.fileformat.info/info/unicode/char/00f6/index.htm) to represent the letter with umlaut. 
+Or we can use two characters, one for the o and one character to denote the presence of two dots over the previous character [\\U0308](https://www.fileformat.info/info/unicode/char/0308/index.htm)
+
+```{r}
+s1 <- "sch\U00f6n"
+s2 <- "scho\U0308n"
+```
+
+These two strings will print the same for us as human readers.
+
+```{r}
+s1
+s2
+```
+
+However, they are not equal.
+
+```{r}
+s1 == s2
+```
+
+This poses a problem for the avalanche effect, which is needed for feature hashing to perform correctly. The avalanche effect will results in these two words (which should be identical) hashing to completely different values.
+
+```{r}
+murmur3.32(s1)
+murmur3.32(s2)
+```
+
+We can deal with this problem by performing **text normalization** on our text before feeding it into our preprocessing engine.
+One library to perform text normalization is the **stringi** package which includes many different text normalization methods.
+How these methods work is beyond the scope of this book, but know that the text normalization functions make text like our two versions of "schön" equivalent. We will use `stri_trans_nfc()` for this example, which performs Canonical Decomposition, followed by Canonical Composition.
+
+```{r}
+library(stringi)
+
+stri_trans_nfc(s1) == stri_trans_nfc(s2)
+
+murmur3.32(stri_trans_nfc(s1))
+murmur3.32(stri_trans_nfc(s2))
+```
+
+Now we see that the strings are equal after normalization.
+
+```{block, type = "rmdwarning"}
+This issue is important even if you don't use feature hashing in your machine learning. 
+```
+
+Since these words are encoded in different ways, they will be counted separately when we are counting token frequencies. 
+Representing what should be a single token in multiple ways will split the counts. This will introduce noise in the best case, and in worse cases, some tokens will fall below the cutoff when we select tokens, leading to a loss of potentially informative words.
+
+Luckily this is easily addressed by using `stri_trans_nfc()` on our text columns before starting preprocessing.
+
+## What evaluation metrics are appropriate?
+
+We have focused on using accuracy and ROC AUC as metrics for our classification models so far, along with sensitivity and specificity in Section \@ref(comparetosvm). These are not the only classification metrics available and your choice will often depend on how much you care about false positives compared to false negatives.
+
+If you know before you fit your model that you want to compute one or more metrics, you can specify them in a call to `metric_set()`. Let's set up a tuning grid for two new classification metrics, `recall` and `precision`.
+
+```{r, eval = FALSE}
+nb_rs <- fit_resamples(
+  nb_wf,
+  complaints_folds,
+  metrics = metric_set(recall, precision)
+)
+```
+
+If you have already fit your model, you can still compute and explore non-default metrics as long as you saved the predictions for your resampled datasets using `control_resamples(save_pred = TRUE)`. 
+
+Let's go back to the naive Bayes model we tuned in Section \@ref(classfirstmodel), with predictions stored in `nb_rs_predictions`. We can compute the overall [recall](https://en.wikipedia.org/wiki/Precision_and_recall#Recall).
+
+```{r}
+nb_rs_predictions %>%
+  recall(product, .pred_class)
+```
+
+We can also compute the recall for each resample using `group_by()`.
+
+```{r}
+nb_rs_predictions %>%
+  group_by(id) %>%
+  recall(product, .pred_class)
+```
+
+Many of the metrics used for classification are functions of the true positive, true negative, false positive, and false negative rates. 
+The confusion matrix, the contingency table of observed classes and predicted classes, gives us information on these rates directly.
+
+```{r}
+nb_rs_predictions %>%
+  filter(id == "Fold01") %>%
+  conf_mat(product, .pred_class)
+```
+
+It is possible with many datasets to achieve high accuracy just by predicting the majority class all the time, but such a model is not useful in the real world. Accuracy alone is often not a good way to assess the performance of classification models.
+
+```{block, type = "rmdnote"}
+For the full set of classification metric options, see the [yardstick documentation](https://yardstick.tidymodels.org/reference/).
+```
+
+
+## The full game: classification
+
+We have come a long way from our first classification model in Section \@ref(classfirstmodel) and it is time to see how we can use what we have learned to improve it.
+We started this chapter with a simple naive Bayes model and n-gram token counts.
+Since then have we looked at different models, preprocessing techniques, and domain-specific feature engineering.
+For our final model, let's use some of the domain-specific features we developed in Section \@ref(customfeatures) along with n-grams. Our model doesn't have any significant hyperparameters to tune but we will tune the number of tokens to include. For this final model we will:
+
+- train on the same set of cross-validation resamples used throughout this chapter,
+- tune the number of tokens used in the model,
+- include trigrams, bigrams, and unigrams,
+- include custom-engineered features,
+- remove the Snowball stop word lexicon, and
+- finally evaluate on the testing set, which we have not touched at all yet.
+
+### Feature selection
+
+We start by creating a new preprocessing recipe. 
+Let's use the same predictors and handle `date_received` and `tags` in the same way.
+
+```{r complaintrecfinal1, dependson="complaintssplit"}
+complaints_rec_v2 <- 
+  recipe(product ~ date_received + tags + consumer_complaint_narrative, 
+         data = complaints_train) %>%
+  step_date(date_received, features = c("month", "dow"), role = "dates") %>%
+  step_rm(date_received) %>%
+  step_dummy(has_role("dates")) %>%
+  step_unknown(tags) %>%
+  step_dummy(tags)
+```
+
+After exploring this text data more in Section \@ref(customfeatures), we want to add these custom features to our final model.
+To do this, we use `step_textfeature()` to compute custom text features. 
+We create a list of the custom text features and pass this list to `step_textfeature()` via the `extract_functions` argument. 
+Note how we have to take a copy of `consumer_complaint_narrative` using `step_mutate()` as `step_textfeature()` consumes the column.
+
+```{r complaintrecfinal2, dependson="complaintrecfinal1"}
+extract_funs <- list(creditcard_count = creditcard_count, 
+                     procent_censoring = procent_censoring, 
+                     max_money = max_money)
+
+complaints_rec_v2 <- complaints_rec_v2 %>%
+  step_mutate(narrative_copy = consumer_complaint_narrative) %>%
+  step_textfeature(narrative_copy, extract_functions = extract_funs)
+```
+
+The tokenization and stop word removal will be similar to the other models in this chapter, but this time we'll include trigrams, bigrams, and unigrams in the model.
+In our original model, we only included 500 tokens; for our final model, let's treat the number of tokens as a hyperparameter that we vary when we tune the final model.
+Let's also set the `min_times` argument to 50, to throw away tokens that appear less than 50 times in the entire corpus.
+We want our model to be robust and a token needs to appear enough times before we include it.
+
+```{block, type = "rmdnote"}
+This dataset has many more than 50 of the most common 2000 tokens, but it can still be good practice to specify `min_times` to be safe. Your choice for `min_times` should depend on your data and how robust you need your model to be.
+```
+
+```{r complaintrecfinal3, dependson="complaintrecfinal2"}
+complaints_rec_v2 <- complaints_rec_v2 %>%
+  step_tokenize(consumer_complaint_narrative) %>%
+  step_stopwords(consumer_complaint_narrative) %>%
+  step_ngram(consumer_complaint_narrative, num_tokens = 3, min_num_tokens = 1) %>%
+  step_tokenfilter(consumer_complaint_narrative, 
+                   max_tokens = tune(), min_times = 250) %>%
+  step_tfidf(consumer_complaint_narrative)
+```
+
+### Specify the model
+
+We use the Support Vector Machine model since it performed well in Section \@ref(comparetosvm). We can reuse parts of the old workflow and update the recipe specification.
+
+```{r nbwf2, dependson=c("svmspec", "complaintrecfinal3")}
+svm_wf_v2 <- svm_wf %>%
+  update_recipe(complaints_rec_v2)
+
+svm_wf_v2
+```
+
+Let's create a grid of possible hyperparameter values using `grid_regular()` from the dials package. 
+With `levels = 5`, we have five possible values to try for the maximum number of tokens to include in the model.
+
+```{r}
+param_grid <- grid_regular(max_tokens(range = c(500, 2000)),
+                           levels = 5)
+
+param_grid
+```
+
+Now it's time to set up our tuning grid. Let’s save the predictions so we can explore them in more detail, and let's also set the same custom metrics for this SVM model.
+
+```{r, message=FALSE, eval=!online}
+set.seed(2020)
+tune_rs <- tune_grid(
+  svm_wf_v2,
+  complaints_folds,
+  grid = param_grid, 
+  metrics = metric_set(accuracy, sensitivity, specificity),
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+```{r include=FALSE, eval=!online}
+tune_rs$splits <- NULL
+write_rds(tune_rs, "data/ml_class_final_tune.rds")
+```
+
+```{r, include=FALSE, eval=online}
+tune_rs <- read_rds("data/ml_class_final_tune.rds")
+```
+
+We have fitted these classification models!
+
+### Evaluate the modeling
+
+Now that the tuning is finished, we can take a look at the best performing results.
+
+```{r}
+show_best(tune_rs, metric = "accuracy")
+```
+
+We see that `r select_best(tune_rs, metric = "accuracy") %>% pull(max_tokens)` tokens is a good middle ground before we start to overfit.
+We can extract the best hyperparameter and use it to finalize the workflow.
+
+```{r}
+best_accuracy <- select_best(tune_rs, "accuracy")
+
+svm_wf_final <- finalize_workflow(
+  svm_wf_v2,
+  best_accuracy
+)
+
+svm_wf_final
+```
+
+The `svm_wf_final` workflow now has a finalized value for `max_tokens`.
+
+Finally, let's return to our testing data.
+
+```{block, type = "rmdwarning"}
+The test set is a precious resource that can only be used to estimate performance of your final model on new data. We did not use the test set to compare or tune models, but we use it now that our model is finalized.
+```
+
+We can use the function `last_fit()` to **fit** our model to our training data and **evaluate** our model on our testing data.
+
+```{r finalres}
+final_res <- svm_wf_final %>%
+  last_fit(complaints_split, metrics = metric_set(accuracy))
+```
+
+Let's explore our results using `collect_metrics()` and `collect_predictions()`.
+
+```{r finalresmetrics, dependson="finalres", eval = !online}
+final_res_metrics <- collect_metrics(final_res)
+final_res_predictions <- collect_predictions(final_res)
+```
+
+```{r, include = FALSE, eval = !online}
+write_rds(final_res_metrics, "data/ml_class_final_res_metrics.rds")
+write_rds(final_res_predictions, "data/ml_class_final_res_predictions.rds")
+```
+
+```{r, include = FALSE, eval = online}
+final_res_metrics <- read_rds("data/ml_class_final_res_metrics.rds")
+final_res_predictions <- read_rds("data/ml_class_final_res_predictions.rds")
+```
+
+How does the final model performance on the testing data look?
+
+```{r}
+final_res_metrics
+```
+
+This is pretty good, and we note that this result is close to what we saw from the training dataset. This is an indication that our model is not overfit and is able to generalize well enough.
+
+The confusion matrix on the testing data in Figure \@ref(fig:finalheatmap) also yields pleasing results. It appears symmetric with a strong presence on the diagonal, showing that there isn't any strong bias towards either of the classes.
+
+```{r, finalheatmap, fig.cap="Confusion matrix on the test set for final Support Vector Machine classifier"}
+final_res_predictions %>% 
+  conf_mat(truth = product, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+## Summary {#mlclassificationsummary}
+
+You can use classification modeling to predict labels or categorical variables from a dataset, including datasets that include text.
+Naive Bayes models can perform well with text data since each feature is handled independently and thus large numbers of features are computational feasible.
+This is important as bag-of-word text models can involve thousands of tokens.
+We also saw that Support Vector Machine models perform well for text data.
+Your own domain knowledge about your text data is incredibly valuable, and using that knowledge in careful engineering of custom features can improve your model.
+
+### In this chapter, you learned:
+
+- how text data can be used in a classification model
+- to tune hyperparameters in the data preprocessing stage
+- how to compare different model types
+- how feature hashing can be used as a fast alternative to bag-of-words
+- about engineering custom features for machine learning
+- about performance metrics for classification models
